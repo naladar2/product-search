@@ -1,34 +1,34 @@
 // product-search.js
 // Поиск товара по фото: локально в браузере, через CLIP (image-to-image similarity).
-// Модель качается один раз (~90 МБ, кэшируется браузером) и дальше всё работает офлайн.
-//
-// Использование:
-//   import { buildIndex, findSimilar, getIndexSize, clearIndex } from './product-search.js';
-//
-//   // products — массив строк из твоей таблицы: [{ code, images: [url1, url2] }, ...]
-//   // code = колонка D, images = ссылки из колонок J и K (пустые/битые пропускаются)
-//   await buildIndex(products, { onProgress: (done, total) => console.log(done, total) });
-//
-//   // file — File/Blob с фото (например из <input type="file" accept="image/*" capture="environment">)
-//   const matches = await findSimilar(file, 5);
-//   // matches: [{ code, imageUrl, score }] отсортировано по убыванию score (0..1)
 
-import { AutoProcessor, CLIPVisionModelWithProjection, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0/+esm';
-import { get, set, entries, clear } from 'https://cdn.jsdelivr.net/npm/idb-keyval@6/+esm';
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0/+esm';
 
-const MODEL_ID = 'Xenova/clip-vit-base-patch32';
-const DB_PREFIX = 'clip-embed:'; // ключ в idb-keyval = DB_PREFIX + imageUrl
+// Настройка окружения для работы без eval
+env.allowLocalModels = false;
+env.useBrowserCache = true;
 
-let processorPromise = null;
-let modelPromise = null;
+// Используем pipeline вместо прямого вызова модели
+let extractor = null;
 
-function loadModel() {
-  if (!processorPromise) processorPromise = AutoProcessor.from_pretrained(MODEL_ID);
-  if (!modelPromise) modelPromise = CLIPVisionModelWithProjection.from_pretrained(MODEL_ID, { quantized: true });
-  return Promise.all([processorPromise, modelPromise]);
+async function getExtractor() {
+  if (!extractor) {
+    try {
+      // Используем pipeline для создания feature extractor
+      extractor = await pipeline('image-feature-extraction', 'Xenova/clip-vit-base-patch32', {
+        quantized: true,
+        // Важно: не использовать прогресс для упрощения
+        progress_callback: null
+      });
+    } catch (err) {
+      console.error('Ошибка загрузки модели:', err);
+      throw err;
+    }
+  }
+  return extractor;
 }
 
 function normalize(vec) {
+  if (!vec || !vec.length) return new Float32Array(0);
   let norm = 0;
   for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
   norm = Math.sqrt(norm) || 1;
@@ -38,28 +38,96 @@ function normalize(vec) {
 }
 
 function cosine(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  return dot; // оба вектора уже нормализованы -> dot = cosine similarity
+  return dot;
 }
 
-// image: URL-строка, File/Blob, HTMLImageElement/HTMLCanvasElement
 async function embedImage(image) {
-  const [processor, model] = await loadModel();
-  const raw = typeof image === 'string'
-    ? await RawImage.fromURL(image)
-    : await RawImage.read(image);
-  const inputs = await processor(raw);
-  const { image_embeds } = await model(inputs);
-  return normalize(image_embeds.data);
+  const extractor = await getExtractor();
+  
+  let imageData;
+  if (typeof image === 'string') {
+    // Для URL используем fetch с обходом CORS
+    const response = await fetch(image);
+    const blob = await response.blob();
+    imageData = blob;
+  } else {
+    imageData = image;
+  }
+  
+  // Получаем эмбеддинг через pipeline
+  const result = await extractor(imageData, {
+    pooling: 'mean',
+    normalize: true
+  });
+  
+  // result - это массив с эмбеддингом
+  return result;
 }
 
-/**
- * Строит/обновляет индекс эмбеддингов для каталога.
- * Уже проиндексированные (по url) картинки повторно не считаются — можно звать при каждом запуске.
- * @param {{code:string, images:string[]}[]} products
- * @param {{onProgress?:(done:number,total:number)=>void, force?:boolean}} opts
- */
+const DB_PREFIX = 'clip-embed:';
+
+// Используем IndexedDB напрямую
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('ClipIndexDB', 1);
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains('embeddings')) {
+        db.createObjectStore('embeddings', { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getEmbedding(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('embeddings', 'readonly');
+    const store = tx.objectStore('embeddings');
+    const request = store.get(key);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function setEmbedding(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('embeddings', 'readwrite');
+    const store = tx.objectStore('embeddings');
+    const request = store.put({ id: key, ...value });
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getAllEmbeddings() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('embeddings', 'readonly');
+    const store = tx.objectStore('embeddings');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function clearAll() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('embeddings', 'readwrite');
+    const store = tx.objectStore('embeddings');
+    const request = store.clear();
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
 export async function buildIndex(products, opts = {}) {
   const { onProgress, force = false } = opts;
 
@@ -67,49 +135,50 @@ export async function buildIndex(products, opts = {}) {
   for (const p of products) {
     if (!p.code || !Array.isArray(p.images)) continue;
     for (const url of p.images) {
-      if (url) jobs.push({ code: p.code, url });
+      if (url && url.startsWith('http')) jobs.push({ code: p.code, url });
     }
   }
 
   let done = 0;
   let indexed = 0;
+  const errors = [];
+
   for (const { code, url } of jobs) {
     const key = DB_PREFIX + url;
     if (!force) {
-      const existing = await get(key);
-      if (existing) { done++; onProgress?.(done, jobs.length); continue; }
+      const existing = await getEmbedding(key);
+      if (existing) {
+        done++;
+        onProgress?.(done, jobs.length);
+        continue;
+      }
     }
     try {
       const embedding = await embedImage(url);
-      await set(key, { code, url, embedding: Array.from(embedding) });
+      await setEmbedding(key, { code, url, embedding: Array.from(embedding) });
       indexed++;
     } catch (err) {
-      // Частая причина — CORS на хостинге картинки, или битая ссылка. Пропускаем и едем дальше.
-      console.warn('Не удалось проиндексировать', url, err);
+      errors.push({ url, error: err.message });
+      console.warn('Не удалось проиндексировать:', url, err.message);
     }
     done++;
     onProgress?.(done, jobs.length);
   }
-  return { total: jobs.length, indexed };
+
+  return { total: jobs.length, indexed, errors };
 }
 
-/**
- * Ищет похожие товары по фото.
- * @param {File|Blob|string|HTMLImageElement} photo
- * @param {number} topN
- * @returns {Promise<{code:string, imageUrl:string, score:number}[]>}
- */
 export async function findSimilar(photo, topN = 5) {
   const queryEmbedding = await embedImage(photo);
-  const all = await entries();
+  const all = await getAllEmbeddings();
 
   const scored = [];
-  for (const [key, value] of all) {
-    if (typeof key !== 'string' || !key.startsWith(DB_PREFIX)) continue;
-    const embedding = Float32Array.from(value.embedding);
+  for (const item of all) {
+    if (!item.id || !item.id.startsWith(DB_PREFIX)) continue;
+    const embedding = Float32Array.from(item.embedding);
     scored.push({
-      code: value.code,
-      imageUrl: value.url,
+      code: item.code,
+      imageUrl: item.url,
       score: cosine(queryEmbedding, embedding),
     });
   }
@@ -119,10 +188,10 @@ export async function findSimilar(photo, topN = 5) {
 }
 
 export async function getIndexSize() {
-  const all = await entries();
-  return all.filter(([k]) => typeof k === 'string' && k.startsWith(DB_PREFIX)).length;
+  const all = await getAllEmbeddings();
+  return all.filter(item => item.id && item.id.startsWith(DB_PREFIX)).length;
 }
 
 export async function clearIndex() {
-  await clear();
+  await clearAll();
 }
