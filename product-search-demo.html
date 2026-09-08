@@ -122,10 +122,37 @@
   const COL_CODE = 3, COL_IMG1 = 9, COL_IMG2 = 10;
 
   function parseCsv(text) {
-    return text.trim().split('\n').map(line =>
-      // простой разбор CSV с учётом кавычек
-      line.match(/(".*?"|[^,]+)(?=,|$)/g)?.map(v => v.replace(/^"|"$/g, '').trim()) ?? []
-    );
+    // Полноценный разбор CSV: корректно обрабатывает кавычки, запятые
+    // и переносы строк ВНУТРИ кавычек (например, многострочные названия товаров).
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; } // экранированная кавычка ""
+          else { inQuotes = false; }
+        } else {
+          field += c;
+        }
+      } else if (c === '"') {
+        inQuotes = true;
+      } else if (c === ',') {
+        row.push(field); field = '';
+      } else if (c === '\r') {
+        // игнорируем, перевод строки обработает \n
+      } else if (c === '\n') {
+        row.push(field); field = '';
+        rows.push(row); row = [];
+      } else {
+        field += c;
+      }
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows.filter(r => r.some(v => v !== ''));
   }
 
   async function loadProductsFromSheet(url) {
