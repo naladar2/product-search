@@ -1,11 +1,23 @@
 // product-search.js
 // Поиск товара по фото: локально в браузере, через CLIP (image-to-image similarity).
+// Модель качается один раз (~90 МБ, кэшируется браузером) и дальше всё работает офлайн.
+//
+// Использование:
+//   import { buildIndex, findSimilar, getIndexSize, clearIndex } from './product-search.js';
+//
+//   // products — массив строк из твоей таблицы: [{ code, images: [url1, url2] }, ...]
+//   // code = колонка D, images = ссылки из колонок J и K (пустые/битые пропускаются)
+//   await buildIndex(products, { onProgress: (done, total) => console.log(done, total) });
+//
+//   // file — File/Blob с фото (например из <input type="file" accept="image/*" capture="environment">)
+//   const matches = await findSimilar(file, 5);
+//   // matches: [{ code, imageUrl, score }] отсортировано по убыванию score (0..1)
 
 import { AutoProcessor, CLIPVisionModelWithProjection, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0/+esm';
 import { get, set, entries, clear } from 'https://cdn.jsdelivr.net/npm/idb-keyval@6/+esm';
 
 const MODEL_ID = 'Xenova/clip-vit-base-patch32';
-const DB_PREFIX = 'clip-embed:';
+const DB_PREFIX = 'clip-embed:'; // ключ в idb-keyval = DB_PREFIX + imageUrl
 
 let processorPromise = null;
 let modelPromise = null;
@@ -28,34 +40,26 @@ function normalize(vec) {
 function cosine(a, b) {
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  return dot;
+  return dot; // оба вектора уже нормализованы -> dot = cosine similarity
 }
 
+// image: URL-строка, File/Blob, HTMLImageElement/HTMLCanvasElement
 async function embedImage(image) {
   const [processor, model] = await loadModel();
-  let raw;
-  try {
-    if (typeof image === 'string') {
-      // Пробуем загрузить через fetch с обходом CORS
-      try {
-        raw = await RawImage.fromURL(image);
-      } catch (corsError) {
-        console.warn('CORS ошибка при загрузке:', image, corsError);
-        throw new Error(`Не удалось загрузить изображение: ${image.substring(0, 50)}... (CORS)`);
-      }
-    } else {
-      raw = await RawImage.read(image);
-    }
-  } catch (err) {
-    console.error('Ошибка загрузки изображения:', err);
-    throw err;
-  }
-  
+  const raw = typeof image === 'string'
+    ? await RawImage.fromURL(image)
+    : await RawImage.read(image);
   const inputs = await processor(raw);
   const { image_embeds } = await model(inputs);
   return normalize(image_embeds.data);
 }
 
+/**
+ * Строит/обновляет индекс эмбеддингов для каталога.
+ * Уже проиндексированные (по url) картинки повторно не считаются — можно звать при каждом запуске.
+ * @param {{code:string, images:string[]}[]} products
+ * @param {{onProgress?:(done:number,total:number)=>void, force?:boolean}} opts
+ */
 export async function buildIndex(products, opts = {}) {
   const { onProgress, force = false } = opts;
 
@@ -63,43 +67,38 @@ export async function buildIndex(products, opts = {}) {
   for (const p of products) {
     if (!p.code || !Array.isArray(p.images)) continue;
     for (const url of p.images) {
-      if (url && url.startsWith('http')) jobs.push({ code: p.code, url });
+      if (url) jobs.push({ code: p.code, url });
     }
   }
 
   let done = 0;
   let indexed = 0;
-  const errors = [];
-
   for (const { code, url } of jobs) {
     const key = DB_PREFIX + url;
     if (!force) {
       const existing = await get(key);
-      if (existing) { 
-        done++; 
-        onProgress?.(done, jobs.length); 
-        continue; 
-      }
+      if (existing) { done++; onProgress?.(done, jobs.length); continue; }
     }
     try {
       const embedding = await embedImage(url);
       await set(key, { code, url, embedding: Array.from(embedding) });
       indexed++;
     } catch (err) {
-      errors.push({ url, error: err.message });
-      console.warn('Не удалось проиндексировать:', url, err.message);
+      // Частая причина — CORS на хостинге картинки, или битая ссылка. Пропускаем и едем дальше.
+      console.warn('Не удалось проиндексировать', url, err);
     }
     done++;
     onProgress?.(done, jobs.length);
   }
-
-  if (errors.length > 0) {
-    console.warn(`Индексировано с ошибками: ${errors.length} из ${jobs.length}`);
-  }
-
-  return { total: jobs.length, indexed, errors };
+  return { total: jobs.length, indexed };
 }
 
+/**
+ * Ищет похожие товары по фото.
+ * @param {File|Blob|string|HTMLImageElement} photo
+ * @param {number} topN
+ * @returns {Promise<{code:string, imageUrl:string, score:number}[]>}
+ */
 export async function findSimilar(photo, topN = 5) {
   const queryEmbedding = await embedImage(photo);
   const all = await entries();

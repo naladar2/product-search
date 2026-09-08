@@ -14,7 +14,6 @@
     --accent:#f2b134;
     --accent-dim:#7a5c1c;
     --good:#4fd68a;
-    --error:#e74c3c;
   }
   *{box-sizing:border-box;}
   body{
@@ -51,7 +50,6 @@
   .btn-secondary{background:transparent; color:var(--dim); border:1px solid var(--line); width:100%; margin-top:8px;}
 
   .status{font-size:12.5px; color:var(--dim); margin-top:8px; min-height:16px;}
-  .status.error{color:var(--error);}
   .bar{height:4px; background:var(--line); border-radius:2px; margin-top:8px; overflow:hidden; display:none;}
   .bar.active{display:block;}
   .bar > div{height:100%; background:var(--accent); width:0%; transition:width .2s;}
@@ -74,28 +72,6 @@
   .result:first-child{border-color:var(--accent);}
 
   .hint{font-size:11.5px; color:var(--dim); line-height:1.5; margin-top:10px;}
-  
-  .test-section {
-    margin-top: 12px;
-    padding: 10px;
-    background: #1a1d24;
-    border-radius: 6px;
-    border: 1px solid var(--line);
-  }
-  .test-section summary {
-    cursor: pointer;
-    color: var(--dim);
-    font-size: 12px;
-  }
-  .test-section pre {
-    font-size: 11px;
-    color: var(--dim);
-    overflow: auto;
-    max-height: 200px;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    margin: 8px 0 0;
-  }
 </style>
 </head>
 <body>
@@ -115,12 +91,8 @@
     <div class="status" id="buildStatus"></div>
     <div class="hint">
       Файл → Опубликовать в интернете → выбрать лист → CSV. Колонки: D — код товара, J и K — ссылки на фото.
+      Строки без ссылок пропускаются, уже проиндексированные — не пересчитываются.
     </div>
-    
-    <details class="test-section">
-      <summary>Показать отладочную информацию</summary>
-      <pre id="debugInfo">Ожидание...</pre>
-    </details>
   </div>
 
   <div class="panel">
@@ -134,7 +106,7 @@
 </main>
 
 <script type="module">
-  import { buildIndex, findSimilar, getIndexSize, clearIndex } from './product-search.js';
+  import { buildIndex, findSimilar, getIndexSize } from './product-search.js';
 
   const sheetUrlInput = document.getElementById('sheetUrl');
   const buildBtn = document.getElementById('buildBtn');
@@ -145,133 +117,42 @@
   const captureLabel = document.getElementById('captureLabel');
   const searchStatus = document.getElementById('searchStatus');
   const results = document.getElementById('results');
-  const debugInfo = document.getElementById('debugInfo');
 
   // Колонки в таблице: D=3, J=9, K=10 (считая от A=0)
   const COL_CODE = 3, COL_IMG1 = 9, COL_IMG2 = 10;
 
-  /**
-   * Надёжный парсер CSV с поддержкой кавычек
-   */
   function parseCsv(text) {
-    const rows = [];
-    let currentRow = [];
-    let currentField = '';
-    let insideQuotes = false;
-    let i = 0;
-    
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    
-    while (i < text.length) {
-      const char = text[i];
-      const nextChar = text[i + 1];
-      
-      if (insideQuotes) {
-        if (char === '"') {
-          if (nextChar === '"') {
-            currentField += '"';
-            i += 2;
-          } else {
-            insideQuotes = false;
-            i++;
-          }
-        } else {
-          currentField += char;
-          i++;
-        }
-      } else {
-        if (char === '"') {
-          insideQuotes = true;
-          i++;
-        } else if (char === ',') {
-          currentRow.push(currentField.trim());
-          currentField = '';
-          i++;
-        } else if (char === '\n' || char === '\r') {
-          if (char === '\r' && nextChar === '\n') {
-            i += 2;
-          } else {
-            i++;
-          }
-          currentRow.push(currentField.trim());
-          currentField = '';
-          if (currentRow.some(f => f !== '')) {
-            rows.push(currentRow);
-          }
-          currentRow = [];
-        } else {
-          currentField += char;
-          i++;
-        }
-      }
-    }
-    
-    if (currentField !== '' || currentRow.length > 0) {
-      currentRow.push(currentField.trim());
-      if (currentRow.some(f => f !== '')) {
-        rows.push(currentRow);
-      }
-    }
-    
-    return rows;
+    return text.trim().split('\n').map(line =>
+      // простой разбор CSV с учётом кавычек
+      line.match(/(".*?"|[^,]+)(?=,|$)/g)?.map(v => v.replace(/^"|"$/g, '').trim()) ?? []
+    );
   }
 
   async function loadProductsFromSheet(url) {
     const res = await fetch(url);
     if (!res.ok) throw new Error('Не удалось загрузить таблицу (' + res.status + ')');
-    const text = await res.text();
-    const rows = parseCsv(text);
-    
-    if (rows.length < 2) {
-      throw new Error('В таблице недостаточно данных. Нужна хотя бы 1 строка с данными после заголовков.');
-    }
-    
-    // Отладка
-    debugInfo.textContent = `Загружено строк: ${rows.length}\nПервые 3 строки:\n${JSON.stringify(rows.slice(0, 3), null, 2)}`;
-    
-    const products = rows.slice(1)
-      .map((r, idx) => {
-        const code = r[COL_CODE] || '';
-        const img1 = r[COL_IMG1] || '';
-        const img2 = r[COL_IMG2] || '';
-        const images = [img1, img2].filter(Boolean);
-        return { code, images };
-      })
+    const rows = parseCsv(await res.text());
+    return rows.slice(1) // первая строка — заголовки
+      .map(r => ({
+        code: r[COL_CODE],
+        images: [r[COL_IMG1], r[COL_IMG2]].filter(Boolean),
+      }))
       .filter(p => p.code && p.images.length);
-    
-    if (products.length === 0) {
-      throw new Error('Не найдено товаров с кодом (колонка D) и ссылками на фото (колонки J или K)');
-    }
-    
-    debugInfo.textContent += `\n\nНайдено товаров с фото: ${products.length}\nПример: ${JSON.stringify(products.slice(0, 3), null, 2)}`;
-    
-    return products;
   }
 
   async function refreshIndexedCount() {
-    try {
-      const n = await getIndexSize();
-      if (n > 0) {
-        captureLabel.classList.remove('disabled');
-        captureLabel.textContent = 'Сфотографировать';
-        buildStatus.textContent = `В индексе: ${n} фото`;
-      } else {
-        captureLabel.classList.add('disabled');
-        captureLabel.textContent = 'Сначала постройте индекс';
-      }
-    } catch (e) {
-      console.warn('Ошибка при получении размера индекса:', e);
+    const n = await getIndexSize();
+    if (n > 0) {
+      captureLabel.classList.remove('disabled');
+      captureLabel.textContent = 'Сфотографировать';
+      buildStatus.textContent = `В индексе: ${n} фото`;
     }
   }
-  
   refreshIndexedCount();
 
   buildBtn.addEventListener('click', async () => {
     const url = sheetUrlInput.value.trim();
-    if (!url) { 
-      buildStatus.textContent = 'Вставьте ссылку на CSV-публикацию листа'; 
-      return; 
-    }
+    if (!url) { buildStatus.textContent = 'Вставьте ссылку на CSV-публикацию листа'; return; }
 
     buildBtn.disabled = true;
     bar.classList.add('active');
@@ -292,9 +173,7 @@
       buildStatus.textContent = `Готово. Новых фото: ${indexed} из ${total} проверенных.`;
       await refreshIndexedCount();
     } catch (err) {
-      buildStatus.innerHTML = `<span class="error">Ошибка: ${err.message}</span>`;
-      console.error('Ошибка:', err);
-      debugInfo.textContent += `\n\nОшибка: ${err.message}\n${err.stack || ''}`;
+      buildStatus.textContent = 'Ошибка: ' + err.message;
     } finally {
       buildBtn.disabled = false;
       bar.classList.remove('active');
@@ -314,7 +193,7 @@
 
       results.innerHTML = matches.map(m => `
         <div class="result">
-          <img src="${m.imageUrl}" loading="lazy" onerror="this.style.display='none'">
+          <img src="${m.imageUrl}" loading="lazy">
           <div>
             <div class="code">${m.code}</div>
             <div class="score">совпадение: ${(m.score * 100).toFixed(1)}%</div>
@@ -323,13 +202,8 @@
       `).join('');
     } catch (err) {
       searchStatus.textContent = 'Ошибка: ' + err.message;
-      console.error(err);
     }
   });
-
-  // Для отладки CORS-ошибок при загрузке картинок
-  console.log('Если вы видите ошибки CORS с Kaspersky-лабс, это расширение антивируса, которое блокирует запросы.');
-  console.log('Попробуйте отключить расширение Касперского или переключить браузер в режим инкогнито.');
 </script>
 
 </body>
