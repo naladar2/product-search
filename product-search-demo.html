@@ -72,6 +72,7 @@
   .result:first-child{border-color:var(--accent);}
 
   .hint{font-size:11.5px; color:var(--dim); line-height:1.5; margin-top:10px;}
+  .error{color:#e74c3c; font-weight:600;}
 </style>
 </head>
 <body>
@@ -121,31 +122,126 @@
   // Колонки в таблице: D=3, J=9, K=10 (считая от A=0)
   const COL_CODE = 3, COL_IMG1 = 9, COL_IMG2 = 10;
 
+  /**
+   * Надёжный парсер CSV с поддержкой кавычек, экранированных кавычек и пробелов
+   */
   function parseCsv(text) {
-    return text.trim().split('\n').map(line =>
-      // простой разбор CSV с учётом кавычек
-      line.match(/(".*?"|[^,]+)(?=,|$)/g)?.map(v => v.replace(/^"|"$/g, '').trim()) ?? []
-    );
+    const rows = [];
+    let currentRow = [];
+    let currentField = '';
+    let insideQuotes = false;
+    let i = 0;
+    
+    // Удаляем BOM если есть
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    
+    while (i < text.length) {
+      const char = text[i];
+      const nextChar = text[i + 1];
+      
+      if (insideQuotes) {
+        if (char === '"') {
+          if (nextChar === '"') {
+            // Экранированная кавычка
+            currentField += '"';
+            i += 2;
+          } else {
+            // Закрытие кавычек
+            insideQuotes = false;
+            i++;
+          }
+        } else {
+          currentField += char;
+          i++;
+        }
+      } else {
+        if (char === '"') {
+          insideQuotes = true;
+          i++;
+        } else if (char === ',') {
+          // Конец поля
+          currentRow.push(currentField.trim());
+          currentField = '';
+          i++;
+        } else if (char === '\n' || char === '\r') {
+          // Конец строки
+          if (char === '\r' && nextChar === '\n') {
+            i += 2; // Windows CRLF
+          } else {
+            i++;
+          }
+          currentRow.push(currentField.trim());
+          currentField = '';
+          // Проверяем, что строка не пустая
+          if (currentRow.some(f => f !== '')) {
+            rows.push(currentRow);
+          }
+          currentRow = [];
+        } else {
+          currentField += char;
+          i++;
+        }
+      }
+    }
+    
+    // Последнее поле
+    if (currentField !== '' || currentRow.length > 0) {
+      currentRow.push(currentField.trim());
+      if (currentRow.some(f => f !== '')) {
+        rows.push(currentRow);
+      }
+    }
+    
+    return rows;
   }
 
   async function loadProductsFromSheet(url) {
     const res = await fetch(url);
     if (!res.ok) throw new Error('Не удалось загрузить таблицу (' + res.status + ')');
-    const rows = parseCsv(await res.text());
-    return rows.slice(1) // первая строка — заголовки
-      .map(r => ({
-        code: r[COL_CODE],
-        images: [r[COL_IMG1], r[COL_IMG2]].filter(Boolean),
-      }))
+    const text = await res.text();
+    const rows = parseCsv(text);
+    
+    if (rows.length < 2) {
+      throw new Error('В таблице недостаточно данных. Нужна хотя бы 1 строка с данными после заголовков.');
+    }
+    
+    // Показываем пример первых 3 строк для отладки
+    console.log('Первые 5 строк таблицы:', rows.slice(0, 5));
+    
+    const products = rows.slice(1) // первая строка — заголовки
+      .map((r, idx) => {
+        // Защита от выхода за границы массива
+        const code = r[COL_CODE] || '';
+        const img1 = r[COL_IMG1] || '';
+        const img2 = r[COL_IMG2] || '';
+        const images = [img1, img2].filter(Boolean);
+        return { code, images };
+      })
       .filter(p => p.code && p.images.length);
+    
+    if (products.length === 0) {
+      throw new Error('Не найдено товаров с кодом (колонка D) и ссылками на фото (колонки J или K)');
+    }
+    
+    console.log(`Найдено ${products.length} товаров с фото`);
+    console.log('Пример:', products.slice(0, 3));
+    
+    return products;
   }
 
   async function refreshIndexedCount() {
-    const n = await getIndexSize();
-    if (n > 0) {
-      captureLabel.classList.remove('disabled');
-      captureLabel.textContent = 'Сфотографировать';
-      buildStatus.textContent = `В индексе: ${n} фото`;
+    try {
+      const n = await getIndexSize();
+      if (n > 0) {
+        captureLabel.classList.remove('disabled');
+        captureLabel.textContent = 'Сфотографировать';
+        buildStatus.textContent = `В индексе: ${n} фото`;
+      } else {
+        captureLabel.classList.add('disabled');
+        captureLabel.textContent = 'Сначала постройте индекс';
+      }
+    } catch (e) {
+      console.warn('Ошибка при получении размера индекса:', e);
     }
   }
   refreshIndexedCount();
@@ -173,7 +269,8 @@
       buildStatus.textContent = `Готово. Новых фото: ${indexed} из ${total} проверенных.`;
       await refreshIndexedCount();
     } catch (err) {
-      buildStatus.textContent = 'Ошибка: ' + err.message;
+      buildStatus.innerHTML = `<span class="error">Ошибка: ${err.message}</span>`;
+      console.error(err);
     } finally {
       buildBtn.disabled = false;
       bar.classList.remove('active');
@@ -193,7 +290,7 @@
 
       results.innerHTML = matches.map(m => `
         <div class="result">
-          <img src="${m.imageUrl}" loading="lazy">
+          <img src="${m.imageUrl}" loading="lazy" onerror="this.style.display='none'">
           <div>
             <div class="code">${m.code}</div>
             <div class="score">совпадение: ${(m.score * 100).toFixed(1)}%</div>
@@ -202,8 +299,12 @@
       `).join('');
     } catch (err) {
       searchStatus.textContent = 'Ошибка: ' + err.message;
+      console.error(err);
     }
   });
+
+  // Восстанавливаем кнопку, если в индексе уже есть данные
+  setTimeout(refreshIndexedCount, 1000);
 </script>
 
 </body>
