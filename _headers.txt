@@ -1,0 +1,2 @@
+/*
+  Content-Security-Policy: script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; worker-src 'self' blob:; connect-src *;

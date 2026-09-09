@@ -72,7 +72,25 @@
   .result:first-child{border-color:var(--accent);}
 
   .hint{font-size:11.5px; color:var(--dim); line-height:1.5; margin-top:10px;}
+
+  .result{cursor:pointer;}
+  .result .meta{min-width:0;}
+  .result .name{font-size:12.5px; color:var(--text); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .result .sub{font-size:11.5px; color:var(--dim); margin-top:2px;}
+
+  #barcodeModal{
+    position:fixed; inset:0; background:#fff; z-index:1000;
+    display:none; flex-direction:column; align-items:center; justify-content:center; padding:20px;
+  }
+  #barcodeModal.open{display:flex;}
+  #barcodeModal .close{
+    position:absolute; top:16px; right:16px; background:#15171c; color:#fff;
+    width:38px; height:38px; border-radius:50%; font-size:18px; line-height:1;
+  }
+  #barcodeModal .product-title{color:#15171c; font-size:15px; font-weight:700; text-align:center; margin-bottom:14px;}
+  #barcodeModal svg{width:100%; max-width:420px;}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
 </head>
 <body>
 
@@ -85,14 +103,20 @@
 
   <div class="panel">
     <h2>1. ИСТОЧНИК ДАННЫХ</h2>
-    <input type="text" id="sheetUrl" placeholder="Ссылка на лист (публикация в формате CSV)">
+    <input type="text" id="sheetUrl" placeholder="Ссылка на CSV-публикацию листа или на sheet-api.gs Web App">
     <button class="btn-primary" id="buildBtn">Построить / обновить индекс</button>
     <div class="bar" id="bar"><div id="barFill"></div></div>
     <div class="status" id="buildStatus"></div>
     <div class="hint">
-      Файл → Опубликовать в интернете → выбрать лист → CSV. Колонки: D — код товара, J и K — ссылки на фото.
-      Строки без ссылок пропускаются, уже проиндексированные — не пересчитываются.
+      Колонки: D — код товара, J и K — ссылки на фото. Если фото в J/K оформлены как гиперссылка
+      на текст (например «Фото1»), обычный CSV-экспорт эти ссылки не видит — используй Apps Script
+      Web App из sheet-api.gs, он читает гиперссылки корректно.
     </div>
+    <div style="display:flex; gap:8px; margin-top:10px;">
+      <button class="btn-secondary" id="exportBtn" style="margin-top:0;">Экспорт индекса</button>
+      <button class="btn-secondary" id="importBtn" style="margin-top:0;">Импорт индекса</button>
+    </div>
+    <input type="file" id="importFile" accept=".json" style="display:none;">
   </div>
 
   <div class="panel">
@@ -105,8 +129,14 @@
 
 </main>
 
+<div id="barcodeModal">
+  <button class="close" id="barcodeClose">✕</button>
+  <div class="product-title" id="barcodeTitle"></div>
+  <svg id="barcodeSvg"></svg>
+</div>
+
 <script type="module">
-  import { buildIndex, findSimilar, getIndexSize } from './product-search.js';
+  import { buildIndex, findSimilar, getIndexSize, exportIndex, importIndex } from './product-search.js';
 
   const sheetUrlInput = document.getElementById('sheetUrl');
   const buildBtn = document.getElementById('buildBtn');
@@ -117,9 +147,12 @@
   const captureLabel = document.getElementById('captureLabel');
   const searchStatus = document.getElementById('searchStatus');
   const results = document.getElementById('results');
+  const exportBtn = document.getElementById('exportBtn');
+  const importBtn = document.getElementById('importBtn');
+  const importFile = document.getElementById('importFile');
 
-  // Колонки в таблице: D=3, J=9, K=10 (считая от A=0)
-  const COL_CODE = 3, COL_IMG1 = 9, COL_IMG2 = 10;
+  // Колонки в таблице (считая от A=0): A=штрихкод, B=наименование, C=артикул, D=код, J/K=фото
+  const COL_BARCODE = 0, COL_NAME = 1, COL_ARTICLE = 2, COL_CODE = 3, COL_IMG1 = 9, COL_IMG2 = 10;
 
   function parseCsv(text) {
     // Полноценный разбор CSV: корректно обрабатывает кавычки, запятые
@@ -155,16 +188,37 @@
     return rows.filter(r => r.some(v => v !== ''));
   }
 
-  async function loadProductsFromSheet(url) {
+  // В J/K бывает не одна ссылка, а многострочный текст вида
+  // "Фото 3\nФото 4\n...\nhttps://...jpeg\nhttps://...jpeg" — вытаскиваем из него
+  // все реальные ссылки на картинки, а подписи вроде "Фото N" просто игнорируем.
+  function extractImageUrls(cell) {
+    if (!cell) return [];
+    return cell.match(/https?:\/\/[^\s"]+?\.(?:jpe?g|png|webp)(?:\?[^\s"]*)?/gi) || [];
+  }
+
+  async function loadProducts(url) {
     const res = await fetch(url);
-    if (!res.ok) throw new Error('Не удалось загрузить таблицу (' + res.status + ')');
-    const rows = parseCsv(await res.text());
-    return rows.slice(1) // первая строка — заголовки
-      .map(r => ({
-        code: r[COL_CODE],
-        images: [r[COL_IMG1], r[COL_IMG2]].filter(Boolean),
-      }))
-      .filter(p => p.code && p.images.length);
+    if (!res.ok) throw new Error('Не удалось загрузить данные (' + res.status + ')');
+    const text = await res.text();
+
+    try {
+      // Ответ от Apps Script Web App (sheet-api.gs) — уже готовый JSON с корректными ссылками.
+      const json = JSON.parse(text);
+      return json.filter((p) => p.code && p.images?.length);
+    } catch {
+      // Иначе считаем, что это CSV-публикация листа (гиперссылки на текст в ней теряются —
+      // если фото распознаётся мало, переходи на sheet-api.gs).
+      const rows = parseCsv(text);
+      return rows.slice(1) // первая строка — заголовки
+        .map((r) => ({
+          code: r[COL_CODE],
+          barcode: r[COL_BARCODE] || '',
+          name: r[COL_NAME] || '',
+          article: r[COL_ARTICLE] || '',
+          images: [...new Set([...extractImageUrls(r[COL_IMG1]), ...extractImageUrls(r[COL_IMG2])])],
+        }))
+        .filter((p) => p.code && p.images.length);
+    }
   }
 
   async function refreshIndexedCount() {
@@ -187,7 +241,7 @@
     buildStatus.textContent = 'Загружаю модель CLIP (первый раз — до ~90 МБ)...';
 
     try {
-      const products = await loadProductsFromSheet(url);
+      const products = await loadProducts(url);
       buildStatus.textContent = `Найдено строк: ${products.length}. Индексирую фото...`;
 
       const { total, indexed } = await buildIndex(products, {
@@ -207,6 +261,32 @@
     }
   });
 
+  exportBtn.addEventListener('click', async () => {
+    const json = await exportIndex();
+    const blob = new Blob([json], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `product-index-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+
+  importBtn.addEventListener('click', () => importFile.click());
+
+  importFile.addEventListener('change', async () => {
+    const file = importFile.files[0];
+    if (!file) return;
+    buildStatus.textContent = 'Импортирую индекс...';
+    try {
+      const count = await importIndex(await file.text());
+      buildStatus.textContent = `Импортировано записей: ${count}`;
+      await refreshIndexedCount();
+    } catch (err) {
+      buildStatus.textContent = 'Ошибка импорта: ' + err.message;
+    }
+    importFile.value = '';
+  });
+
   photoInput.addEventListener('change', async () => {
     const file = photoInput.files[0];
     if (!file) return;
@@ -218,19 +298,56 @@
       const matches = await findSimilar(file, 5);
       searchStatus.textContent = matches.length ? '' : 'Совпадений не найдено';
 
-      results.innerHTML = matches.map(m => `
-        <div class="result">
+      results.innerHTML = matches.map((m, i) => `
+        <div class="result" data-idx="${i}">
           <img src="${m.imageUrl}" loading="lazy">
-          <div>
+          <div class="meta">
             <div class="code">${m.code}</div>
+            ${m.name ? `<div class="name">${m.name}</div>` : ''}
+            <div class="sub">${[m.article && `арт. ${m.article}`, m.barcode && `ШК ${m.barcode}`].filter(Boolean).join(' · ')}</div>
             <div class="score">совпадение: ${(m.score * 100).toFixed(1)}%</div>
           </div>
         </div>
       `).join('');
+
+      results.querySelectorAll('.result').forEach((el) => {
+        el.addEventListener('click', () => openBarcode(matches[+el.dataset.idx]));
+      });
     } catch (err) {
       searchStatus.textContent = 'Ошибка: ' + err.message;
     }
   });
+
+  function detectBarcodeFormat(value) {
+    if (/^\d{13}$/.test(value)) return 'EAN13';
+    if (/^\d{12}$/.test(value)) return 'UPC';
+    if (/^\d{8}$/.test(value)) return 'EAN8';
+    return 'CODE128';
+  }
+
+  const barcodeModal = document.getElementById('barcodeModal');
+  const barcodeTitle = document.getElementById('barcodeTitle');
+  const barcodeSvg = document.getElementById('barcodeSvg');
+  document.getElementById('barcodeClose').addEventListener('click', () => barcodeModal.classList.remove('open'));
+
+  function openBarcode(match) {
+    const value = match.barcode || match.code;
+    if (!value) return;
+    barcodeTitle.textContent = [match.name, match.code].filter(Boolean).join(' — ');
+    try {
+      JsBarcode(barcodeSvg, value, {
+        format: detectBarcodeFormat(value),
+        width: 3,
+        height: 160,
+        displayValue: true,
+        background: '#ffffff',
+        lineColor: '#000000',
+      });
+      barcodeModal.classList.add('open');
+    } catch (err) {
+      alert('Не удалось построить штрихкод: ' + err.message);
+    }
+  }
 </script>
 
 </body>
