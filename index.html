@@ -137,6 +137,7 @@
   <button class="close" id="barcodeClose">✕</button>
   <div class="product-title" id="barcodeTitle"></div>
   <svg id="barcodeSvg"></svg>
+  <button class="btn-primary" id="printBtn" style="margin-top:18px; max-width:420px; width:100%;">Печать на принтере</button>
 </div>
 
 <script type="module">
@@ -332,15 +333,19 @@
   const barcodeModal = document.getElementById('barcodeModal');
   const barcodeTitle = document.getElementById('barcodeTitle');
   const barcodeSvg = document.getElementById('barcodeSvg');
+  const printBtn = document.getElementById('printBtn');
+  let currentPrint = null; // { value, format } последнего открытого штрихкода
   document.getElementById('barcodeClose').addEventListener('click', () => barcodeModal.classList.remove('open'));
 
   function openBarcode(match) {
     const value = match.barcode || match.code;
     if (!value) return;
+    const format = detectBarcodeFormat(value);
+    currentPrint = { value, format };
     barcodeTitle.textContent = [match.name, match.code].filter(Boolean).join(' — ');
     try {
       JsBarcode(barcodeSvg, value, {
-        format: detectBarcodeFormat(value),
+        format,
         width: 3,
         height: 160,
         displayValue: true,
@@ -352,6 +357,17 @@
       alert('Не удалось построить штрихкод: ' + err.message);
     }
   }
+
+  printBtn.addEventListener('click', () => {
+    if (!currentPrint) return;
+    // Android.printBarcode есть только внутри приложения-обёртки (Bluetooth SPP до TSC-принтера) —
+    // Web Bluetooth в браузере classic SPP не поддерживает, поэтому в обычном браузере кнопка недоступна.
+    if (window.Android && window.Android.printBarcode) {
+      window.Android.printBarcode(currentPrint.value, currentPrint.format);
+    } else {
+      alert('Печать работает только в приложении product-search на телефоне (не в браузере)');
+    }
+  });
 </script>
 
 </body>
